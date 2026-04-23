@@ -43,7 +43,10 @@ impl GitEngine {
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(callbacks);
 
-        match git2::Repository::clone(url, path) {
+        let mut builder = git2::build::RepoBuilder::new();
+        builder.fetch_options(fo);
+
+        match builder.clone(url, path) {
             Ok(repo) => {
                 self.repo = Some(repo);
                 info!("Repository cloned successfully");
