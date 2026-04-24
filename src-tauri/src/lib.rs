@@ -8,7 +8,6 @@ use git::GitEngine;
 use sync::{SyncEngine, SyncState, SyncStatus};
 use startup::StartupManager;
 
-use keyring::Entry;
 use std::sync::Mutex;
 use tauri::{
     AppHandle, Manager, State,
@@ -17,11 +16,42 @@ use tauri::{
     Emitter,
 };
 use log::{info, error, LevelFilter};
-use env_logger::Builder;
-use std::io::Write;
 use std::time::SystemTime;
 
-const SERVICE_NAME: &str = "claude_sync";
+
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AppConfig {
+    github_token: Option<String>,
+    repo_url: Option<String>,
+    sync_credentials: Option<bool>,
+}
+
+impl AppConfig {
+    fn get_path() -> std::path::PathBuf {
+        dirs::home_dir()
+            .map(|p| p.join(".claude").join("app_config.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".claude/app_config.json"))
+    }
+
+    fn load() -> Self {
+        let path = Self::get_path();
+        if let Ok(data) = std::fs::read_to_string(path) {
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    fn save(&self) -> Result<(), AppError> {
+        let path = Self::get_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let data = serde_json::to_string_pretty(self).map_err(|e| AppError::system(e.to_string()))?;
+        std::fs::write(path, data).map_err(|e| AppError::system(e.to_string()))
+    }
+}
 
 struct AppState {
     git_engine: Mutex<Option<GitEngine>>,
@@ -30,27 +60,36 @@ struct AppState {
     token: Mutex<Option<String>>,
 }
 
-fn init_logger() {
-    Builder::new()
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "[{}] {} - {}",
-                chrono_lite(),
-                record.level(),
-                record.args()
-            )
-        })
-        .filter(None, LevelFilter::Info)
-        .init();
-}
+use simplelog::*;
+use std::fs::OpenOptions;
 
-fn chrono_lite() -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    format!("{}", now)
+fn init_logger() {
+    let log_dir = dirs::home_dir()
+        .map(|p| p.join(".claude").join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".claude/logs"));
+    
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_file = log_dir.join("claude_sync.log");
+
+    CombinedLogger::init(
+        vec![
+            TermLogger::new(
+                LevelFilter::Info,
+                Config::default(),
+                TerminalMode::Mixed,
+                ColorChoice::Auto
+            ),
+            WriteLogger::new(
+                LevelFilter::Info,
+                Config::default(),
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_file)
+                    .unwrap_or_else(|_| std::fs::File::create(&log_file).unwrap())
+            ),
+        ]
+    ).unwrap_or_else(|e| eprintln!("Failed to initialize simplelog: {}", e));
 }
 
 #[tauri::command]
@@ -71,18 +110,14 @@ fn configure(repo_url: String, token: String, state: State<AppState>) -> Result<
     let mut git_engine = GitEngine::new(repo_path, token.clone());
     git_engine.clone_or_open(&repo_url)?;
 
-    // Save to keyring securely
-    if let Ok(entry) = Entry::new(SERVICE_NAME, "github_token") {
-        if let Err(e) = entry.set_password(&token) {
-            error!("Failed to save token to keyring: {}", e);
-        } else {
-            info!("Token saved to keyring");
-        }
-    }
-    
-    // Also save repo url
-    if let Ok(entry) = Entry::new(SERVICE_NAME, "repo_url") {
-        let _ = entry.set_password(&repo_url);
+    // Save configuration to JSON
+    let mut config = AppConfig::load();
+    config.github_token = Some(token.clone());
+    config.repo_url = Some(repo_url.clone());
+    if let Err(e) = config.save() {
+        error!("Failed to save config: {}", e);
+    } else {
+        info!("Configuration saved to app_config.json");
     }
 
     let mut git = state.git_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
@@ -102,23 +137,22 @@ fn configure(repo_url: String, token: String, state: State<AppState>) -> Result<
 
 #[tauri::command]
 fn get_saved_configuration(state: State<AppState>) -> Result<bool, AppError> {
-    let token_entry = match Entry::new(SERVICE_NAME, "github_token") {
-        Ok(t) => t,
-        Err(_) => return Ok(false)
-    };
-    let repo_entry = match Entry::new(SERVICE_NAME, "repo_url") {
-        Ok(r) => r,
-        Err(_) => return Ok(false)
+    let config = AppConfig::load();
+    
+    let stored_token = match config.github_token {
+        Some(t) => t,
+        None => {
+            error!("No token found in config");
+            return Ok(false);
+        }
     };
     
-    let stored_token = match token_entry.get_password() {
-        Ok(t) => t,
-        Err(_) => return Ok(false)
-    };
-    
-    let stored_repo = match repo_entry.get_password() {
-        Ok(r) => r,
-        Err(_) => return Ok(false)
+    let stored_repo = match config.repo_url {
+        Some(r) => r,
+        None => {
+            error!("No repo URL found in config");
+            return Ok(false);
+        }
     };
 
     info!("Restoring saved configuration for repo: {}", stored_repo);
@@ -142,10 +176,8 @@ fn get_saved_configuration(state: State<AppState>) -> Result<bool, AppError> {
     let mut tok = state.token.lock().map_err(|e| AppError::system(e.to_string()))?;
     *tok = Some(stored_token);
 
-    if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, "sync_credentials") {
-        if let Ok(val) = entry.get_password() {
-            sync_engine.set_sync_credentials(val == "true");
-        }
+    if let Some(enabled) = config.sync_credentials {
+        sync_engine.set_sync_credentials(enabled);
     }
 
     sync_engine.set_status(SyncStatus::Synced);
@@ -306,10 +338,10 @@ fn set_sync_credentials(enabled: bool, state: State<AppState>) -> Result<(), App
     let mut sync_engine = state.sync_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
     sync_engine.set_sync_credentials(enabled);
 
-    // Save choice? We can just store this config in Keyring or rely on frontend to save it and restore it on boot.
-    // For simplicity, let's just save it into keyring.
-    if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, "sync_credentials") {
-        let _ = entry.set_password(if enabled { "true" } else { "false" });
+    let mut config = AppConfig::load();
+    config.sync_credentials = Some(enabled);
+    if let Err(e) = config.save() {
+        error!("Failed to save sync_credentials to config: {}", e);
     }
 
     Ok(())
@@ -400,6 +432,13 @@ pub fn run() {
 
             info!("Claude Sync setup complete");
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Prevent the app from exiting when window is closed
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_sync_state,

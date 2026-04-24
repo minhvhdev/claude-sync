@@ -76,14 +76,29 @@ impl GitEngine {
         let mut fo = git2::FetchOptions::new();
         fo.remote_callbacks(callbacks);
 
-        remote.fetch(&["main"], Some(&mut fo), None).map_err(|e| AppError::git(e.to_string()))?;
+        let fetch_opts_err = remote.fetch(&["main"], Some(&mut fo), None);
+        if let Err(e) = fetch_opts_err {
+            info!("Fetch returned error: {}. This might happen if remote is empty.", e);
+            return Ok(());
+        }
 
         // Get the remote commit
-        let head = repo.head().map_err(|e| AppError::git(e.to_string()))?;
-        let remote_oid = head.target().ok_or_else(|| AppError::git("No head oid"))?;
+        let remote_branch = match repo.find_reference("refs/remotes/origin/main") {
+            Ok(r) => r,
+            Err(_) => {
+                info!("No remote origin/main found. Repository might be empty.");
+                return Ok(());
+            }
+        };
 
-        // Perform a reset to the remote commit
+        let remote_oid = remote_branch.target().ok_or_else(|| AppError::git("No target for remote branch"))?;
         let commit = repo.find_commit(remote_oid).map_err(|e| AppError::git(e.to_string()))?;
+        
+        // Ensure HEAD exists or point it to main
+        if repo.head().is_err() {
+            repo.set_head("refs/heads/main").unwrap_or(());
+        }
+
         repo.reset(&commit.into_object(), ResetType::Hard, None)
             .map_err(|e| AppError::git(e.to_string()))?;
 
@@ -91,43 +106,10 @@ impl GitEngine {
         Ok(())
     }
 
-    pub fn push(&self, message: &str) -> Result<(), AppError> {
+    pub fn push(&self, _message: &str) -> Result<(), AppError> {
         let repo = self.repo.as_ref().ok_or_else(|| AppError::system("Repository not initialized"))?;
+        info!("Pushing changes to remote origin");
 
-        info!("Pushing with message: {}", message);
-
-        // Stage all changes
-        let mut index = repo.index().map_err(|e| AppError::git(e.to_string()))?;
-        index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)
-            .map_err(|e| AppError::git(e.to_string()))?;
-        index.write().map_err(|e| AppError::git(e.to_string()))?;
-
-        // Create commit if there are changes
-        let statuses = repo.statuses(None).map_err(|e| AppError::git(e.to_string()))?;
-        if statuses.is_empty() {
-            info!("No changes to commit");
-            return Ok(());
-        }
-
-        let tree_id = index.write_tree().map_err(|e| AppError::git(e.to_string()))?;
-        let tree = repo.find_tree(tree_id).map_err(|e| AppError::git(e.to_string()))?;
-
-        let signature = Signature::now("Claude Sync", "sync@claude.ai")
-            .map_err(|e| AppError::git(e.to_string()))?;
-
-        let head = repo.head().map_err(|e| AppError::git(e.to_string()))?;
-        let parent = head.peel_to_commit().map_err(|e| AppError::git(e.to_string()))?;
-
-        repo.commit(
-            Some("HEAD"),
-            &signature,
-            &signature,
-            message,
-            &tree,
-            &[&parent],
-        ).map_err(|e| AppError::git(e.to_string()))?;
-
-        // Push
         let mut remote = repo.find_remote("origin").map_err(|e| AppError::git(e.to_string()))?;
         let mut callbacks = RemoteCallbacks::new();
         callbacks.credentials(|_url, _username, _cred_type| {
@@ -135,6 +117,15 @@ impl GitEngine {
         });
         let mut push_opts = git2::PushOptions::new();
         push_opts.remote_callbacks(callbacks);
+
+        let head = match repo.head() {
+            Ok(h) => h,
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                info!("Nothing to push yet (UnbornBranch).");
+                return Ok(());
+            }
+            Err(e) => return Err(AppError::git(e.to_string())),
+        };
 
         let refname = format!("refs/heads/{}", head.name().map(|n| n.split('/').last().unwrap_or("main")).unwrap_or("main"));
         remote.push(&[&refname], Some(&mut push_opts)).map_err(|e| AppError::git(e.to_string()))?;
@@ -152,14 +143,32 @@ impl GitEngine {
             .map_err(|e| AppError::git(e.to_string()))?;
         index.write().map_err(|e| AppError::git(e.to_string()))?;
 
+        // Check for changes (don't create empty commits)
+        let statuses = repo.statuses(None).map_err(|e| AppError::git(e.to_string()))?;
+        if statuses.is_empty() {
+             info!("No changes to commit before push");
+             return Ok(());
+        }
+
         let tree_id = index.write_tree().map_err(|e| AppError::git(e.to_string()))?;
         let tree = repo.find_tree(tree_id).map_err(|e| AppError::git(e.to_string()))?;
 
         let signature = Signature::now("Claude Sync", "sync@claude.ai")
             .map_err(|e| AppError::git(e.to_string()))?;
 
-        let head = repo.head().map_err(|e| AppError::git(e.to_string()))?;
-        let parent = head.peel_to_commit().map_err(|e| AppError::git(e.to_string()))?;
+        let parent_commit = match repo.head() {
+            Ok(head) => Some(head.peel_to_commit().map_err(|e| AppError::git(e.to_string()))?),
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                info!("Unborn branch detected. Preparing initial commit.");
+                None
+            }
+            Err(e) => return Err(AppError::git(e.to_string())),
+        };
+
+        let mut parents = Vec::new();
+        if let Some(ref p) = parent_commit {
+            parents.push(p);
+        }
 
         repo.commit(
             Some("HEAD"),
@@ -167,7 +176,7 @@ impl GitEngine {
             &signature,
             message,
             &tree,
-            &[&parent],
+            &parents,
         ).map_err(|e| AppError::git(e.to_string()))?;
 
         info!("Commit created: {}", message);
