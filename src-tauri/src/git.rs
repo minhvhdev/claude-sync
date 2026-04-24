@@ -127,8 +127,13 @@ impl GitEngine {
             Err(e) => return Err(AppError::git(e.to_string())),
         };
 
-        let refname = format!("refs/heads/{}", head.name().map(|n| n.split('/').last().unwrap_or("main")).unwrap_or("main"));
-        remote.push(&[&refname], Some(&mut push_opts)).map_err(|e| AppError::git(e.to_string()))?;
+        let branch_name = head.name().map(|n| n.split('/').last().unwrap_or("main")).unwrap_or("main");
+        let refname = format!("refs/heads/{}", branch_name);
+        
+        // Force push format: +src:dst
+        let refspec = format!("+{}:{}", refname, refname);
+        
+        remote.push(&[&refspec], Some(&mut push_opts)).map_err(|e| AppError::git(e.to_string()))?;
 
         info!("Push completed");
         Ok(())

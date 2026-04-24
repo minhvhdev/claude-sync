@@ -108,7 +108,7 @@ impl SyncEngine {
                 if let Some(parent) = dst.parent() {
                     fs::create_dir_all(parent).map_err(|e| AppError::io(e.to_string()))?;
                 }
-                fs::copy(&src, &dst).map_err(|e| AppError::io(e.to_string()))?;
+                safe_copy(&src, &dst)?;
             }
             info!("Copied {} to {:?}", item, dst);
         }
@@ -120,7 +120,7 @@ impl SyncEngine {
             .join(".claude.json");
 
         if src.exists() {
-            fs::copy(&src, &dst).map_err(|e| AppError::io(e.to_string()))?;
+            safe_copy(&src, &dst)?;
             info!("Copied .claude.json to {:?}", dst);
         }
 
@@ -146,7 +146,7 @@ impl SyncEngine {
                 if let Some(parent) = dst.parent() {
                     fs::create_dir_all(parent).map_err(|e| AppError::io(e.to_string()))?;
                 }
-                fs::copy(&src, &dst).map_err(|e| AppError::io(e.to_string()))?;
+                safe_copy(&src, &dst)?;
             }
             info!("Copied {} to {:?}", item, dst);
         }
@@ -158,7 +158,7 @@ impl SyncEngine {
         let dst = self.repo_dir.join(".claude.json");
 
         if src.exists() {
-            fs::copy(&src, &dst).map_err(|e| AppError::io(e.to_string()))?;
+            safe_copy(&src, &dst)?;
             info!("Copied .claude.json to {:?}", dst);
         }
 
@@ -214,9 +214,23 @@ fn copy_dir_recursive(src: &PathBuf, dst: &PathBuf) -> Result<(), AppError> {
         if path.is_dir() {
             copy_dir_recursive(&path, &dest)?;
         } else {
-            fs::copy(&path, &dest).map_err(|e| AppError::io(e.to_string()))?;
+            safe_copy(&path, &dest)?;
         }
     }
 
     Ok(())
+}
+
+fn safe_copy(src: &PathBuf, dst: &PathBuf) -> Result<u64, AppError> {
+    if dst.exists() {
+        if let Ok(metadata) = fs::metadata(dst) {
+            let mut perms = metadata.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(dst, perms);
+            }
+        }
+        let _ = fs::remove_file(dst);
+    }
+    fs::copy(src, dst).map_err(|e| AppError::io(format!("Copy failed from {:?} to {:?}: {}", src, dst, e)))
 }
