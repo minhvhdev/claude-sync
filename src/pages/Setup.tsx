@@ -26,8 +26,12 @@ export function Setup({ onConfigured }: SetupProps) {
       await invoke("test_connection", { repoUrl, token });
       setSuccess(true);
       setError(null);
-    } catch (e) {
-      setError(`Connection failed: ${e}`);
+    } catch (e: any) {
+      if (e && e.kind) {
+        setError(`Connection failed: ${e.message}`);
+      } else {
+        setError(`Connection failed: ${String(e)}`);
+      }
       setSuccess(false);
     } finally {
       setTesting(false);
@@ -46,8 +50,12 @@ export function Setup({ onConfigured }: SetupProps) {
     try {
       await invoke("configure", { repoUrl, token });
       onConfigured();
-    } catch (e) {
-      setError(`Configuration failed: ${e}`);
+    } catch (e: any) {
+      if (e && e.kind) {
+        setError(`Configuration failed: ${e.message}`);
+      } else {
+        setError(`Configuration failed: ${String(e)}`);
+      }
     } finally {
       setSaving(false);
     }
@@ -93,6 +101,27 @@ export function Setup({ onConfigured }: SetupProps) {
           {testing ? "Testing..." : "Test Connection"}
         </button>
         <button
+          className="btn-secondary"
+          onClick={async () => {
+             setTesting(true);
+             try {
+                const url = await invoke<string>("create_github_repo", { token });
+                setRepoUrl(url);
+                setSuccess(true);
+                setError(null);
+             } catch (e: any) {
+                setError(`Failed to create repo: ${e.message || String(e)}`);
+                setSuccess(false);
+             } finally {
+                setTesting(false);
+             }
+          }}
+          disabled={testing || !token}
+          title="Creates a private 'claude-settings' repo on GitHub"
+        >
+          Create Repo
+        </button>
+        <button
           className="btn-primary"
           onClick={handleSave}
           disabled={saving || !repoUrl || !token}
@@ -108,7 +137,10 @@ export function Setup({ onConfigured }: SetupProps) {
           <li>CLAUDE.md</li>
           <li>commands/</li>
           <li>agents/</li>
+          <li>skills/</li>
+          <li>plugins/</li>
           <li>.claude.json</li>
+          <li>.credentials.json (Optional)</li>
         </ul>
         <p className="note">Your credentials and projects are never synced.</p>
       </div>

@@ -14,8 +14,13 @@ function App() {
 
   const checkConfiguration = async () => {
     try {
-      const repoUrl = await invoke<string | null>("get_repo_url");
-      setConfigured(repoUrl !== null);
+      const isConfigured = await invoke<boolean>("get_saved_configuration");
+      if (isConfigured) {
+        setConfigured(true);
+      } else {
+        const repoUrl = await invoke<string | null>("get_repo_url");
+        setConfigured(repoUrl !== null);
+      }
     } catch (e) {
       console.error("Failed to check configuration:", e);
     } finally {

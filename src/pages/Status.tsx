@@ -5,29 +5,30 @@ import { listen } from "@tauri-apps/api/event";
 interface SyncState {
   status: "Synced" | "Syncing" | "Error" | "NotConfigured";
   last_sync: number | null;
-  watcher_enabled: boolean;
   pending_changes: boolean;
+  sync_credentials: boolean;
 }
 
 export function Status() {
   const [syncState, setSyncState] = useState<SyncState | null>(null);
   const [autostartEnabled, setAutostartEnabled] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
     loadState();
 
-    const unlistenSync = listen("trigger-sync", () => {
-      handleSyncNow();
+    const unlistenPush = listen("tray-push-sync", () => {
+      handlePush();
     });
 
-    const unlistenShutdown = listen("shutdown-sync", () => {
-      handleShutdownSync();
+    const unlistenPull = listen("tray-pull-sync", () => {
+      handlePull();
     });
 
     return () => {
-      unlistenSync.then((fn) => fn());
-      unlistenShutdown.then((fn) => fn());
+      unlistenPush.then((fn) => fn());
+      unlistenPull.then((fn) => fn());
     };
   }, []);
 
@@ -47,38 +48,50 @@ export function Status() {
     }
   };
 
-  const handleSyncNow = async () => {
+  const handlePush = async () => {
     if (syncing) return;
 
     setSyncing(true);
+    setErrorMsg(null);
     setSyncState((prev) => prev ? { ...prev, status: "Syncing" } : null);
 
     try {
-      await invoke("sync_now");
+      await invoke("push_sync");
       await loadState();
-    } catch (e) {
-      console.error("Sync failed:", e);
+    } catch (e: any) {
+      console.error("Push failed:", e);
+      // Construct user-friendly error
+      if (e && e.kind) {
+          setErrorMsg(`${e.kind}: ${e.message}`);
+      } else {
+          setErrorMsg(String(e));
+      }
       setSyncState((prev) => prev ? { ...prev, status: "Error" } : null);
     } finally {
       setSyncing(false);
     }
   };
 
-  const handleShutdownSync = async () => {
-    console.log("Shutdown sync triggered");
-    try {
-      await invoke("sync_now");
-    } catch (e) {
-      console.error("Shutdown sync failed:", e);
-    }
-  };
+  const handlePull = async () => {
+    if (syncing) return;
 
-  const handleToggleWatcher = async (enabled: boolean) => {
+    setSyncing(true);
+    setErrorMsg(null);
+    setSyncState((prev) => prev ? { ...prev, status: "Syncing" } : null);
+
     try {
-      await invoke("toggle_watcher", { enabled });
-      setSyncState((prev) => prev ? { ...prev, watcher_enabled: enabled } : null);
-    } catch (e) {
-      console.error("Failed to toggle watcher:", e);
+      await invoke("pull_sync");
+      await loadState();
+    } catch (e: any) {
+      console.error("Pull failed:", e);
+      if (e && e.kind) {
+          setErrorMsg(`${e.kind}: ${e.message}`);
+      } else {
+          setErrorMsg(String(e));
+      }
+      setSyncState((prev) => prev ? { ...prev, status: "Error" } : null);
+    } finally {
+      setSyncing(false);
     }
   };
 
@@ -86,8 +99,9 @@ export function Status() {
     try {
       await invoke("set_autostart", { enabled });
       setAutostartEnabled(enabled);
-    } catch (e) {
+    } catch (e: any) {
       console.error("Failed to toggle autostart:", e);
+      alert(e.message || String(e));
     }
   };
 
@@ -95,6 +109,16 @@ export function Status() {
     if (!timestamp) return "Never";
     const date = new Date(timestamp * 1000);
     return date.toLocaleString();
+  };
+
+  const handleToggleSyncCredentials = async (enabled: boolean) => {
+    try {
+      await invoke("set_sync_credentials", { enabled });
+      setSyncState((prev) => prev ? { ...prev, sync_credentials: enabled } : null);
+    } catch (e: any) {
+      console.error("Failed to toggle sync credentials:", e);
+      alert(e.message || String(e));
+    }
   };
 
   const getStatusColor = (status: string): string => {
@@ -131,34 +155,32 @@ export function Status() {
           </span>
         </div>
         <p className="last-sync">Last sync: {formatLastSync(syncState?.last_sync ?? null)}</p>
+        
+        {errorMsg && (
+            <div className="error-message" style={{ marginTop: "1rem", color: "#ef4444", fontSize: "0.9rem" }}>
+                {errorMsg}
+            </div>
+        )}
       </div>
 
-      <div className="actions">
+      <div className="actions" style={{ display: 'flex', gap: '1rem', marginBottom: '2rem' }}>
         <button
-          className="btn-primary btn-large"
-          onClick={handleSyncNow}
+          className="btn-primary"
+          onClick={handlePush}
           disabled={syncing}
         >
-          {syncing ? "Syncing..." : "Sync Now"}
+          {syncing ? "Working..." : "Push to GitHub"}
+        </button>
+        <button
+          className="btn-secondary"
+          onClick={handlePull}
+          disabled={syncing}
+        >
+          {syncing ? "Working..." : "Pull from GitHub"}
         </button>
       </div>
 
       <div className="toggle-group">
-        <div className="toggle-row">
-          <div className="toggle-info">
-            <span className="toggle-label">Realtime Watcher</span>
-            <span className="toggle-desc">Automatically sync when files change</span>
-          </div>
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={syncState?.watcher_enabled ?? true}
-              onChange={(e) => handleToggleWatcher(e.target.checked)}
-            />
-            <span className="toggle-slider"></span>
-          </label>
-        </div>
-
         <div className="toggle-row">
           <div className="toggle-info">
             <span className="toggle-label">Start with Windows</span>
@@ -173,6 +195,21 @@ export function Status() {
             <span className="toggle-slider"></span>
           </label>
         </div>
+
+        <div className="toggle-row">
+          <div className="toggle-info">
+            <span className="toggle-label">Sync Credentials</span>
+            <span className="toggle-desc">Also sync .credentials.json</span>
+          </div>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={syncState?.sync_credentials ?? false}
+              onChange={(e) => handleToggleSyncCredentials(e.target.checked)}
+            />
+            <span className="toggle-slider"></span>
+          </label>
+        </div>
       </div>
 
       <div className="info-section">
@@ -182,15 +219,12 @@ export function Status() {
           <li>CLAUDE.md</li>
           <li>commands/</li>
           <li>agents/</li>
+          <li>skills/</li>
+          <li>plugins/</li>
           <li>.claude.json</li>
+          <li>.credentials.json (Optional)</li>
         </ul>
       </div>
-
-      {syncState?.pending_changes && (
-        <div className="pending-banner">
-          Pending changes will be synced on next sync
-        </div>
-      )}
     </div>
   );
 }

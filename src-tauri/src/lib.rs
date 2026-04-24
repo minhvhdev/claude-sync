@@ -1,13 +1,14 @@
+pub mod error;
 mod git;
-mod watcher;
 mod sync;
 mod startup;
 
+use error::AppError;
 use git::GitEngine;
-use watcher::FileWatcher;
 use sync::{SyncEngine, SyncState, SyncStatus};
 use startup::StartupManager;
 
+use keyring::Entry;
 use std::sync::Mutex;
 use tauri::{
     AppHandle, Manager, State,
@@ -15,18 +16,18 @@ use tauri::{
     tray::{TrayIconBuilder, MouseButton, MouseButtonState, TrayIconEvent},
     Emitter,
 };
-use log::{info, LevelFilter};
+use log::{info, error, LevelFilter};
 use env_logger::Builder;
 use std::io::Write;
 use std::time::SystemTime;
 
+const SERVICE_NAME: &str = "claude_sync";
+
 struct AppState {
     git_engine: Mutex<Option<GitEngine>>,
     sync_engine: Mutex<SyncEngine>,
-    watcher: Mutex<FileWatcher>,
     repo_url: Mutex<Option<String>>,
     token: Mutex<Option<String>>,
-    watcher_enabled: Mutex<bool>,
 }
 
 fn init_logger() {
@@ -53,16 +54,16 @@ fn chrono_lite() -> String {
 }
 
 #[tauri::command]
-fn get_sync_state(state: State<AppState>) -> Result<SyncState, String> {
-    let sync_engine = state.sync_engine.lock().map_err(|e| e.to_string())?;
+fn get_sync_state(state: State<AppState>) -> Result<SyncState, AppError> {
+    let sync_engine = state.sync_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
     Ok(sync_engine.get_state().clone())
 }
 
 #[tauri::command]
-fn configure(repo_url: String, token: String, state: State<AppState>) -> Result<(), String> {
+fn configure(repo_url: String, token: String, state: State<AppState>) -> Result<(), AppError> {
     info!("Configuring with repo URL: {}", repo_url);
 
-    let mut sync_engine = state.sync_engine.lock().map_err(|e| e.to_string())?;
+    let mut sync_engine = state.sync_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
     sync_engine.ensure_dirs_exist()?;
 
     let repo_path = sync_engine.get_repo_dir().to_string_lossy().to_string();
@@ -70,13 +71,27 @@ fn configure(repo_url: String, token: String, state: State<AppState>) -> Result<
     let mut git_engine = GitEngine::new(repo_path, token.clone());
     git_engine.clone_or_open(&repo_url)?;
 
-    let mut git = state.git_engine.lock().map_err(|e| e.to_string())?;
+    // Save to keyring securely
+    if let Ok(entry) = Entry::new(SERVICE_NAME, "github_token") {
+        if let Err(e) = entry.set_password(&token) {
+            error!("Failed to save token to keyring: {}", e);
+        } else {
+            info!("Token saved to keyring");
+        }
+    }
+    
+    // Also save repo url
+    if let Ok(entry) = Entry::new(SERVICE_NAME, "repo_url") {
+        let _ = entry.set_password(&repo_url);
+    }
+
+    let mut git = state.git_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
     *git = Some(git_engine);
 
-    let mut url = state.repo_url.lock().map_err(|e| e.to_string())?;
+    let mut url = state.repo_url.lock().map_err(|e| AppError::system(e.to_string()))?;
     *url = Some(repo_url);
 
-    let mut tok = state.token.lock().map_err(|e| e.to_string())?;
+    let mut tok = state.token.lock().map_err(|e| AppError::system(e.to_string()))?;
     *tok = Some(token);
 
     sync_engine.set_status(SyncStatus::Synced);
@@ -86,73 +101,186 @@ fn configure(repo_url: String, token: String, state: State<AppState>) -> Result<
 }
 
 #[tauri::command]
-fn test_connection(repo_url: String, token: String) -> Result<(), String> {
-    info!("Testing connection to: {}", repo_url);
+fn get_saved_configuration(state: State<AppState>) -> Result<bool, AppError> {
+    let token_entry = match Entry::new(SERVICE_NAME, "github_token") {
+        Ok(t) => t,
+        Err(_) => return Ok(false)
+    };
+    let repo_entry = match Entry::new(SERVICE_NAME, "repo_url") {
+        Ok(r) => r,
+        Err(_) => return Ok(false)
+    };
+    
+    let stored_token = match token_entry.get_password() {
+        Ok(t) => t,
+        Err(_) => return Ok(false)
+    };
+    
+    let stored_repo = match repo_entry.get_password() {
+        Ok(r) => r,
+        Err(_) => return Ok(false)
+    };
 
-    let temp_path = std::env::temp_dir().join("claude-sync-test-repo");
-    let _ = std::fs::remove_dir_all(&temp_path);
+    info!("Restoring saved configuration for repo: {}", stored_repo);
+    let mut sync_engine = state.sync_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
+    sync_engine.ensure_dirs_exist()?;
+    
+    let repo_path = sync_engine.get_repo_dir().to_string_lossy().to_string();
+    let mut git_engine = GitEngine::new(repo_path, stored_token.clone());
+    
+    if let Err(e) = git_engine.clone_or_open(&stored_repo) {
+        error!("Failed to initialize git engine from saved config: {}", e);
+        return Ok(false);
+    }
 
-    let mut engine = GitEngine::new(temp_path.to_string_lossy().to_string(), token);
-    engine.clone_or_open(&repo_url)?;
+    let mut git = state.git_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
+    *git = Some(git_engine);
 
-    let _ = std::fs::remove_dir_all(&temp_path);
-    info!("Connection test successful");
-    Ok(())
+    let mut url = state.repo_url.lock().map_err(|e| AppError::system(e.to_string()))?;
+    *url = Some(stored_repo);
+
+    let mut tok = state.token.lock().map_err(|e| AppError::system(e.to_string()))?;
+    *tok = Some(stored_token);
+
+    if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, "sync_credentials") {
+        if let Ok(val) = entry.get_password() {
+            sync_engine.set_sync_credentials(val == "true");
+        }
+    }
+
+    sync_engine.set_status(SyncStatus::Synced);
+    
+    Ok(true)
 }
 
 #[tauri::command]
-fn sync_now(state: State<AppState>) -> Result<(), String> {
-    info!("Manual sync triggered");
+fn test_connection(_repo_url: String, token: String) -> Result<(), AppError> {
+    info!("Testing connection to GitHub API");
 
-    let git_engine = state.git_engine.lock().map_err(|e| e.to_string())?;
-    let mut sync_engine = state.sync_engine.lock().map_err(|e| e.to_string())?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("ClaudeSync/1.0")
+        .build()
+        .map_err(|e| AppError::network(e.to_string()))?;
+
+    let res = client.get("https://api.github.com/user")
+        .bearer_auth(token)
+        .send()
+        .map_err(|e| AppError::network(e.to_string()))?;
+
+    if res.status().is_success() {
+        info!("Connection test successful");
+        Ok(())
+    } else {
+        Err(AppError::auth(format!("GitHub API Error: {}", res.status())))
+    }
+}
+
+#[tauri::command]
+fn create_github_repo(token: String) -> Result<String, AppError> {
+    info!("Attempting to create claude-settings repo on GitHub");
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("ClaudeSync/1.0")
+        .build()
+        .map_err(|e| AppError::network(e.to_string()))?;
+
+    let body = serde_json::json!({
+        "name": "claude-settings",
+        "description": "Claude Sync Settings Repository",
+        "private": true
+    });
+
+    let res = client.post("https://api.github.com/user/repos")
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .map_err(|e| AppError::network(e.to_string()))?;
+
+    if res.status().is_success() || res.status() == 422 { 
+        // 422 usually means the repo already exists, but we are asked to create it if it doesn't.
+        // Wait, if 422, we should fetch the repo instead of returning error.
+        if res.status() == 422 {
+            let get_res = client.get("https://api.github.com/user/repos")
+                .bearer_auth(&token)
+                .send()
+                .map_err(|e| AppError::network(e.to_string()))?;
+            
+            if get_res.status().is_success() {
+                let repos: Vec<serde_json::Value> = get_res.json().unwrap_or(vec![]);
+                if let Some(existing) = repos.into_iter().find(|r| r["name"] == "claude-settings") {
+                     return Ok(existing["clone_url"].as_str().unwrap_or("").to_string());
+                }
+            }
+            return Err(AppError::network("Repo already exists but could not retrieve it.".to_string()));
+        }
+
+        let data: serde_json::Value = res.json().map_err(|e| AppError::network(e.to_string()))?;
+        let clone_url = data["clone_url"].as_str().unwrap_or("").to_string();
+        Ok(clone_url)
+    } else {
+        Err(AppError::network(format!("Failed to create repo: {}", res.status())))
+    }
+}
+
+#[tauri::command]
+fn pull_sync(state: State<AppState>) -> Result<(), AppError> {
+    info!("Manual Pull triggered");
+
+    let git_engine = state.git_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
+    let mut sync_engine = state.sync_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
 
     sync_engine.set_status(SyncStatus::Syncing);
 
     if let Some(ref git) = *git_engine {
-        git.pull()?;
+        if let Err(e) = git.pull() {
+            sync_engine.set_status(SyncStatus::Error);
+            return Err(e);
+        }
+    } else {
+        sync_engine.set_status(SyncStatus::Error);
+        return Err(AppError::system("Configuration missing"));
     }
 
-    sync_engine.copy_to_local(&[])?;
-
-    drop(git_engine);
-
-    let git_engine = state.git_engine.lock().map_err(|e| e.to_string())?;
-    if let Some(ref git) = *git_engine {
-        git.add_all_and_commit("manual sync")?;
-        git.push("manual sync")?;
+    if let Err(e) = sync_engine.copy_to_local(&[]) {
+        sync_engine.set_status(SyncStatus::Error);
+        return Err(e);
     }
 
-    let mut sync_engine = state.sync_engine.lock().map_err(|e| e.to_string())?;
     sync_engine.set_status(SyncStatus::Synced);
     sync_engine.set_last_sync(SystemTime::now());
-
     Ok(())
 }
 
 #[tauri::command]
-fn toggle_watcher(enabled: bool, state: State<AppState>, app: AppHandle) -> Result<(), String> {
-    info!("Toggle watcher: {}", enabled);
+fn push_sync(state: State<AppState>) -> Result<(), AppError> {
+    info!("Manual Push triggered");
 
-    let mut watcher_enabled = state.watcher_enabled.lock().map_err(|e| e.to_string())?;
-    *watcher_enabled = enabled;
+    let git_engine = state.git_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
+    let mut sync_engine = state.sync_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
 
-    let mut watcher = state.watcher.lock().map_err(|e| e.to_string())?;
-    let sync_engine = state.sync_engine.lock().map_err(|e| e.to_string())?;
+    sync_engine.set_status(SyncStatus::Syncing);
 
-    if enabled {
-        let path = sync_engine.get_claude_dir().clone();
-        let app_handle = app.clone();
-        watcher.start(path, move || {
-            info!("File change detected, triggering auto-sync");
-            let _ = app_handle.emit("trigger-sync", ());
-        })?;
-    } else {
-        watcher.stop();
+    if let Err(e) = sync_engine.copy_from_local(&[]) {
+        sync_engine.set_status(SyncStatus::Error);
+        return Err(e);
     }
 
-    let mut sync_engine = state.sync_engine.lock().map_err(|e| e.to_string())?;
-    sync_engine.set_watcher_enabled(enabled);
+    if let Some(ref git) = *git_engine {
+        if let Err(e) = git.add_all_and_commit("manual push") {
+            sync_engine.set_status(SyncStatus::Error);
+            return Err(e);
+        }
+        if let Err(e) = git.push("manual push") {
+            sync_engine.set_status(SyncStatus::Error);
+            return Err(e);
+        }
+    } else {
+        sync_engine.set_status(SyncStatus::Error);
+        return Err(AppError::system("Configuration missing"));
+    }
+
+    sync_engine.set_status(SyncStatus::Synced);
+    sync_engine.set_last_sync(SystemTime::now());
 
     Ok(())
 }
@@ -163,13 +291,28 @@ fn get_autostart_enabled(app: AppHandle) -> bool {
 }
 
 #[tauri::command]
-fn set_autostart(enabled: bool, app: AppHandle) -> Result<(), String> {
+fn set_autostart(enabled: bool, app: AppHandle) -> Result<(), AppError> {
     info!("Set autostart: {}", enabled);
     if enabled {
-        StartupManager::enable_autostart(&app)
+        StartupManager::enable_autostart(&app).map_err(|e| AppError::system(e))
     } else {
-        StartupManager::disable_autostart(&app)
+        StartupManager::disable_autostart(&app).map_err(|e| AppError::system(e))
     }
+}
+
+#[tauri::command]
+fn set_sync_credentials(enabled: bool, state: State<AppState>) -> Result<(), AppError> {
+    info!("Set sync credentials: {}", enabled);
+    let mut sync_engine = state.sync_engine.lock().map_err(|e| AppError::system(e.to_string()))?;
+    sync_engine.set_sync_credentials(enabled);
+
+    // Save choice? We can just store this config in Keyring or rely on frontend to save it and restore it on boot.
+    // For simplicity, let's just save it into keyring.
+    if let Ok(entry) = keyring::Entry::new(SERVICE_NAME, "sync_credentials") {
+        let _ = entry.set_password(if enabled { "true" } else { "false" });
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -178,20 +321,31 @@ fn get_repo_url(state: State<AppState>) -> Option<String> {
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let sync_now = MenuItem::with_id(app, "sync_now", "Sync Now", true, None::<&str>)?;
+    let push_menu = MenuItem::with_id(app, "push_sync", "Push to GitHub", true, None::<&str>)?;
+    let pull_menu = MenuItem::with_id(app, "pull_sync", "Pull from GitHub", true, None::<&str>)?;
     let open_settings = MenuItem::with_id(app, "open_settings", "Open Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-    let menu = Menu::with_items(app, &[&sync_now, &open_settings, &quit])?;
+    let menu = Menu::with_items(app, &[&push_menu, &pull_menu, &open_settings, &quit])?;
 
-    let _tray = TrayIconBuilder::new()
+    let mut tray_builder = TrayIconBuilder::new()
         .menu(&menu)
-        .tooltip("Claude Sync")
+        .tooltip("Claude Sync");
+
+    if let Some(icon) = app.default_window_icon() {
+        tray_builder = tray_builder.icon(icon.clone());
+    }
+
+    let _tray = tray_builder
         .on_menu_event(|app, event| {
             match event.id.as_ref() {
-                "sync_now" => {
-                    info!("Tray: Sync Now clicked");
-                    let _ = app.emit("tray-sync-now", ());
+                "push_sync" => {
+                    info!("Tray: Push to GitHub clicked");
+                    let _ = app.emit("tray-push-sync", ());
+                }
+                "pull_sync" => {
+                    info!("Tray: Pull from GitHub clicked");
+                    let _ = app.emit("tray-pull-sync", ());
                 }
                 "open_settings" => {
                     info!("Tray: Open Settings clicked");
@@ -236,25 +390,13 @@ pub fn run() {
         .manage(AppState {
             git_engine: Mutex::new(None),
             sync_engine: Mutex::new(SyncEngine::new()),
-            watcher: Mutex::new(FileWatcher::new()),
             repo_url: Mutex::new(None),
             token: Mutex::new(None),
-            watcher_enabled: Mutex::new(true),
         })
         .setup(|app| {
             info!("Setting up Claude Sync application");
 
             setup_tray(app)?;
-
-            let _app_handle = app.handle().clone();
-
-            // Auto-sync on startup after a short delay
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                info!("Startup sync triggered");
-                let _ = handle.emit("trigger-sync", ());
-            });
 
             info!("Claude Sync setup complete");
             Ok(())
@@ -262,11 +404,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_sync_state,
             configure,
+            get_saved_configuration,
             test_connection,
-            sync_now,
-            toggle_watcher,
+            create_github_repo,
+            pull_sync,
+            push_sync,
             get_autostart_enabled,
             set_autostart,
+            set_sync_credentials,
             get_repo_url,
         ])
         .run(tauri::generate_context!())
